@@ -1,0 +1,268 @@
+#Extension 3D Slicer untuk segmentasi semi otomatis
+
+import os
+import unittest
+import logging
+import slicer.util
+import slicer, vtk, qt, ctk
+from slicer.ScriptedLoadableModule import *
+from slicer.util import VTKObservationMixin
+from skimage.morphology import disk
+from skimage.segmentation import morphological_geodesic_active_contour, inverse_gaussian_gradient
+import numpy as np
+
+class NerveModule(ScriptedLoadableModule):
+    def __init__(self, parent):
+        ScriptedLoadableModule.__init__(self, parent)
+        self.parent.title = "Nerve Module"
+        self.parent.categories = ["Segmentation"]
+        self.parent.dependencies = []
+        self.parent.contributors = ["Yuma"]
+        self.parent.helpText = """
+        Module for semi-automatic and automatic segmentation of nervous system structures
+        using active contour models with enhanced sensitivity.
+        """
+        self.parent.acknowledgementText = ""
+
+class NerveModuleWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+    def __init__(self, parent=None):
+        ScriptedLoadableModuleWidget.__init__(self, parent)
+        VTKObservationMixin.__init__(self)
+        self.paintEffect = None
+        self.paintSegmentationNode = None
+
+    def setup(self):
+        ScriptedLoadableModuleWidget.setup(self)
+        
+        # Load UI file
+        uiWidget = slicer.util.loadUI(self.resourcePath('UI/NerveModule.ui'))
+        self.layout.addWidget(uiWidget)
+        self.ui = slicer.util.childWidgetVariables(uiWidget)
+        
+        # Input & Output
+        self.ui.inputVolumeSelector.nodeTypes = ["vtkMRMLScalarVolumeNode"]
+        self.ui.inputVolumeSelector.setMRMLScene(slicer.mrmlScene)
+        
+        self.ui.outputSegmentationSelector.nodeTypes = ["vtkMRMLSegmentationNode"]
+        self.ui.outputSegmentationSelector.setMRMLScene(slicer.mrmlScene)
+        
+        # Parameter
+        self.ui.thresholdSlider.minimum = 0
+        self.ui.thresholdSlider.maximum = 100
+        self.ui.thresholdSlider.singleStep = 1
+        self.ui.thresholdSlider.value = 30
+        
+        self.ui.iterationsSpinBox.minimum = 10
+        self.ui.iterationsSpinBox.maximum = 500
+        self.ui.iterationsSpinBox.value = 120
+        
+        self.ui.smoothingSpinBox.minimum = 1
+        self.ui.smoothingSpinBox.maximum = 10
+        self.ui.smoothingSpinBox.value = 3
+        
+        self.ui.balloonSlider.minimum = -5
+        self.ui.balloonSlider.maximum = 5
+        self.ui.balloonSlider.value = 1
+        self.ui.balloonSlider.singleStep = 0.1
+        
+        # Buttons
+        self.ui.paintButton.connect('clicked(bool)', self.onPaintButton)
+        self.ui.applyButton.connect('clicked(bool)', self.onApplyButton)
+        self.ui.scanButton.connect('clicked(bool)', self.onScanButton)
+        
+        self.initializeParameterNode()
+
+    def initializeParameterNode(self):
+        """Ensure parameter node exists and observed."""
+        self.logic = NerveModuleLogic()
+
+    def onPaintButton(self):
+        """Aktifkan efek Paint untuk inisialisasi segmentasi."""
+        inputVolume = self.ui.inputVolumeSelector.currentNode()
+        if not inputVolume:
+            slicer.util.errorDisplay("Silakan pilih input volume terlebih dahulu.")
+            return
+
+        self.paintSegmentationNode = slicer.mrmlScene.GetFirstNodeByName("PaintSegmentation")
+        if not self.paintSegmentationNode:
+            self.paintSegmentationNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLSegmentationNode", "PaintSegmentation")
+            self.paintSegmentationNode.CreateDefaultDisplayNodes()
+            self.paintSegmentationNode.SetReferenceImageGeometryParameterFromVolumeNode(inputVolume)
+
+        slicer.util.selectModule("SegmentEditor")
+
+        segModuleWidget = slicer.util.getModuleWidget("SegmentEditor")
+        if not segModuleWidget or not hasattr(segModuleWidget, "editor"):
+            slicer.util.errorDisplay("Tidak dapat mengakses Segment Editor widget.")
+            return
+        self.segmentEditorWidget = segModuleWidget.editor  
+
+        if not self.segmentEditorWidget.mrmlScene():
+            self.segmentEditorWidget.setMRMLScene(slicer.mrmlScene)
+        if not self.segmentEditorWidget.mrmlSegmentEditorNode():
+            segEditorNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+            self.segmentEditorWidget.setMRMLSegmentEditorNode(segEditorNode)
+
+        self.segmentEditorWidget.setSegmentationNode(self.paintSegmentationNode)
+        self.segmentEditorWidget.setMasterVolumeNode(inputVolume)
+
+        self.segmentEditorWidget.setActiveEffectByName("Paint")
+        paintEffect = self.segmentEditorWidget.activeEffect()
+        if paintEffect:
+            paintEffect.setParameter("BrushSphere_radius", 5)  
+        else:
+            slicer.util.errorDisplay("Gagal mengaktifkan efek Paint.")
+    def applyActiveContour(self, inputVolume, initMask, iterations=100, smoothing=3, balloon=1):
+        """Apply active contour model with enhanced parameters."""
+        imageArray = slicer.util.arrayFromVolume(inputVolume)
+
+        imageArray = (imageArray - np.min(imageArray)) / (np.max(imageArray) - np.min(imageArray))
+
+        gimage = inverse_gaussian_gradient(imageArray, alpha=1000, sigma=2) 
+
+        ls = morphological_geodesic_active_contour(
+            gimage,
+            num_iter=iterations,
+            init_level_set=initMask,
+            smoothing=smoothing,
+            balloon=balloon,
+            threshold=0.1 
+        )
+        
+        return (ls > 0).astype(np.uint8) * 255
+
+    def onApplyButton(self):
+        """Run the segmentation with current parameters."""
+        inputVolume = self.ui.inputVolumeSelector.currentNode()
+        outputSegmentation = self.ui.outputSegmentationSelector.currentNode()
+        
+        if not inputVolume or not outputSegmentation:
+            slicer.util.errorDisplay("Please select both input and output nodes")
+            return
+
+        self.paintSegmentationNode = slicer.mrmlScene.GetFirstNodeByName("PaintSegmentation")
+        if not self.paintSegmentationNode or self.paintSegmentationNode.GetSegmentation().GetNumberOfSegments() == 0:
+            slicer.util.errorDisplay("Please paint an initial region first")
+            return
+
+        tempLabelmap = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "TempLabelmap")
+        slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
+            self.paintSegmentationNode, tempLabelmap, inputVolume)
+
+        initMaskArray = slicer.util.arrayFromVolume(tempLabelmap)
+        initMask = initMaskArray > 0
+
+        progressDialog = qt.QProgressDialog()
+        progressDialog.labelText = "Running Active Contour Segmentation..."
+        progressDialog.minimum = 0
+        progressDialog.maximum = 0 
+        progressDialog.show()
+        
+        slicer.app.processEvents() 
+        
+        try:
+            resultArray = self.applyActiveContour(
+                inputVolume,
+                initMask,
+                iterations=self.ui.iterationsSpinBox.value,
+                smoothing=self.ui.smoothingSpinBox.value,
+                balloon=self.ui.balloonSlider.value
+            )
+            
+            if resultArray is None or np.max(resultArray) == 0:
+                slicer.util.errorDisplay("Segmentation failed. No region was segmented.")
+                return
+
+            resultLabelmap = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "ResultLabelmap")
+            slicer.util.updateVolumeFromArray(resultLabelmap, resultArray)
+            resultLabelmap.SetSpacing(inputVolume.GetSpacing())
+            resultLabelmap.SetOrigin(inputVolume.GetOrigin())
+            
+            matrix = vtk.vtkMatrix4x4()
+            inputVolume.GetIJKToRASMatrix(matrix)
+            resultLabelmap.SetIJKToRASMatrix(matrix)
+            
+            outputSegmentation.CreateDefaultDisplayNodes()
+            outputSegmentation.SetReferenceImageGeometryParameterFromVolumeNode(inputVolume)
+            slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(resultLabelmap, outputSegmentation)
+
+            segmentation = outputSegmentation.GetSegmentation()
+            if segmentation.GetNumberOfSegments() == 0:
+                segmentId = segmentation.AddEmptySegment("Nerve")
+            else:
+                segmentId = segmentation.GetNthSegmentID(0)
+            segmentation.GetSegment(segmentId).SetName("Nerve")
+            segmentation.GetSegment(segmentId).SetColor(1, 0, 0)  
+
+            if not segmentation.CreateRepresentation("ClosedSurface"):
+                slicer.util.errorDisplay("Failed to create surface representation")
+
+            slicer.util.setSliceViewerLayers(background=inputVolume, label=outputSegmentation, labelOpacity=0.7)
+            
+        finally:
+            progressDialog.close()
+            slicer.mrmlScene.RemoveNode(tempLabelmap)
+            if 'resultLabelmap' in locals():
+                slicer.mrmlScene.RemoveNode(resultLabelmap)
+
+    def onScanButton(self):
+        """Optional: Add functionality for full volume scanning"""
+        slicer.util.infoDisplay("Scan functionality not yet implemented")
+
+class NerveModuleLogic(ScriptedLoadableModuleLogic):
+    def __init__(self):
+        ScriptedLoadableModuleLogic.__init__(self)
+        
+    def process(self, inputVolume, outputSegmentation, threshold):
+        """Run the processing algorithm."""
+        if not inputVolume or not outputSegmentation:
+            raise ValueError("Input or output volume is invalid")
+        
+        import time
+        startTime = time.time()
+        logging.info('Processing started')
+        
+        stopTime = time.time()
+        logging.info(f'Processing completed in {stopTime-startTime:.2f} seconds')
+        
+        return True
+
+class NerveModuleTest(ScriptedLoadableModuleTest):
+    def setUp(self):
+        """Reset the state - typically a scene clear will be enough."""
+        slicer.mrmlScene.Clear()
+        
+    def runTest(self):
+        """Run as few or as many tests as needed here."""
+        self.setUp()
+        self.test_NerveModule1()
+        
+    def test_NerveModule1(self):
+        """Ideally you should have several levels of tests."""
+        self.delayDisplay("Starting the test")
+
+        import SampleData
+        inputVolume = SampleData.downloadSample("MRBrainTumor1")
+        outputSegmentation = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode")
+
+        self.delayDisplay("Testing basic functionality")
+
+        widget = NerveModuleWidget()
+        widget.setup()
+
+        widget.ui.inputVolumeSelector.setCurrentNode(inputVolume)
+        widget.ui.outputSegmentationSelector.setCurrentNode(outputSegmentation)
+
+        paintSegmentation = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", "PaintSegmentation")
+        paintSegmentation.CreateDefaultDisplayNodes()
+        paintSegmentation.SetReferenceImageGeometryParameterFromVolumeNode(inputVolume)
+
+        try:
+            widget.onApplyButton()
+            self.delayDisplay("Segmentation applied successfully")
+        except Exception as e:
+            self.delayDisplay(f"Segmentation failed: {str(e)}")
+            raise
+        
+        self.delayDisplay('Test Passed')
